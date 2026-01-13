@@ -3,3 +3,6 @@ i8kctl
 
 # vim swap files
 /**/*.swp
+
+# nix result
+result
