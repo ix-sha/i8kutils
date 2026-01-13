@@ -1,15 +1,18 @@
 #!/bin/bash
-I8KCTL=/usr/bin/i8kctl
+# Use i8kctl from PATH instead of hardcoded /usr/bin location
+# This makes it compatible with NixOS and other non-FHS distributions
+I8KCTL=$(command -v i8kctl)
 
-if [ -x $I8KCTL ]; then
+if [ -n "$I8KCTL" ] && [ -x "$I8KCTL" ]; then
 	if [[ "$@" == "-h" ]]; then
 		echo "Usage: i8kfan [left right]";
 		echo "       i8kfan [-v]";
 	elif [[ "$@" == "-v" ]]; then
-		exec $I8KCTL "-v";
+		exec "$I8KCTL" "-v";
 	else
-		exec $I8KCTL "fan" "$@";
+		exec "$I8KCTL" "fan" "$@";
 	fi
 else
-	echo "Error: i8kfan needs $I8KCTL";
+	echo "Error: i8kfan needs i8kctl in PATH";
+	exit 1
 fi

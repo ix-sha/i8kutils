@@ -18,7 +18,7 @@
 array set config {
     sysconfig    /etc/i8kmon.conf
     userconfig   ~/.i8kmon
-    i8kfan       /usr/bin/i8kfan
+    i8kfan       "i8kfan"
     acpi         "acpi"
     use_conf     1
     verbose      0
