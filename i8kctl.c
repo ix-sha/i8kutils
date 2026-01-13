@@ -25,11 +25,126 @@
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
+#include <dirent.h>
+#include <errno.h>
 
 #include "i8k.h"
 #include "i8kctl.h"
 
 static int i8k_fd;
+static int use_hwmon = 0;
+static char hwmon_path[256] = {0};
+
+/* Helper function to find dell-smm-hwmon device */
+static int
+find_dell_hwmon()
+{
+    DIR *dir;
+    struct dirent *entry;
+    char path[512];
+    char name[64];
+    FILE *fp;
+
+    dir = opendir("/sys/class/hwmon");
+    if (!dir) {
+        return -1;
+    }
+
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.') {
+            continue;
+        }
+
+        snprintf(path, sizeof(path), "/sys/class/hwmon/%s/name", entry->d_name);
+        fp = fopen(path, "r");
+        if (fp) {
+            if (fgets(name, sizeof(name), fp)) {
+                /* Remove newline */
+                name[strcspn(name, "\n")] = 0;
+                if (strcmp(name, "dell_smm") == 0) {
+                    snprintf(hwmon_path, sizeof(hwmon_path), "/sys/class/hwmon/%s", entry->d_name);
+                    fclose(fp);
+                    closedir(dir);
+                    return 0;
+                }
+            }
+            fclose(fp);
+        }
+    }
+
+    closedir(dir);
+    return -1;
+}
+
+/* Helper function to read integer from sysfs file */
+static int
+read_hwmon_int(const char *filename)
+{
+    char path[512];
+    FILE *fp;
+    int value;
+
+    snprintf(path, sizeof(path), "%s/%s", hwmon_path, filename);
+    fp = fopen(path, "r");
+    if (!fp) {
+        return -1;
+    }
+
+    if (fscanf(fp, "%d", &value) != 1) {
+        fclose(fp);
+        return -1;
+    }
+
+    fclose(fp);
+    return value;
+}
+
+/* Helper function to write integer to sysfs file */
+static int
+write_hwmon_int(const char *filename, int value)
+{
+    char path[512];
+    FILE *fp;
+
+    snprintf(path, sizeof(path), "%s/%s", hwmon_path, filename);
+    fp = fopen(path, "w");
+    if (!fp) {
+        return -1;
+    }
+
+    if (fprintf(fp, "%d\n", value) < 0) {
+        fclose(fp);
+        return -1;
+    }
+
+    fclose(fp);
+    return 0;
+}
+
+/* Helper function to read string from sysfs file */
+static char *
+read_hwmon_string(const char *filename)
+{
+    char path[512];
+    FILE *fp;
+    static char buffer[256];
+
+    snprintf(path, sizeof(path), "%s/%s", hwmon_path, filename);
+    fp = fopen(path, "r");
+    if (!fp) {
+        return NULL;
+    }
+
+    if (fgets(buffer, sizeof(buffer), fp) == NULL) {
+        fclose(fp);
+        return NULL;
+    }
+
+    /* Remove newline */
+    buffer[strcspn(buffer, "\n")] = 0;
+    fclose(fp);
+    return buffer;
+}
 
 char *
 i8k_get_bios_version()
@@ -51,6 +166,21 @@ i8k_get_bios_version()
     int args[1];
     int rc_read;
     int ret_nargs;
+
+    if (use_hwmon) {
+        /* Try to read BIOS version from DMI */
+        FILE *fp = fopen("/sys/class/dmi/id/bios_version", "r");
+        if (fp) {
+            static char bios_ver[64];
+            if (fgets(bios_ver, sizeof(bios_ver), fp)) {
+                bios_ver[strcspn(bios_ver, "\n")] = 0;
+                fclose(fp);
+                return strdup(bios_ver);
+            }
+            fclose(fp);
+        }
+        return strdup("?");
+    }
 
     if ((rc_read=read(i8k_fd, proc_i8k_str, 64*sizeof(char))) != -1) {
 
@@ -99,6 +229,21 @@ i8k_get_machine_id()
     char args[16];
     int rc;
 
+    if (use_hwmon) {
+        /* Try to read machine ID from DMI */
+        FILE *fp = fopen("/sys/class/dmi/id/product_name", "r");
+        if (fp) {
+            static char machine_id[64];
+            if (fgets(machine_id, sizeof(machine_id), fp)) {
+                machine_id[strcspn(machine_id, "\n")] = 0;
+                fclose(fp);
+                return strdup(machine_id);
+            }
+            fclose(fp);
+        }
+        return NULL;
+    }
+
     if ((rc=ioctl(i8k_fd, I8K_MACHINE_ID, &args)) < 0) {
 	return NULL;
     }
@@ -111,6 +256,39 @@ i8k_set_fan(int fan, int speed)
 {
     int args[2];
     int rc;
+
+    if (use_hwmon) {
+        /* Map fan state to pwm value and set pwm_enable to manual mode */
+        const char *pwm_file = (fan == I8K_FAN_LEFT) ? "pwm1" : "pwm2";
+        const char *pwm_enable_file = (fan == I8K_FAN_LEFT) ? "pwm1_enable" : "pwm2_enable";
+        int pwm_value;
+
+        /* Set to manual mode (1) */
+        if (write_hwmon_int(pwm_enable_file, 1) < 0) {
+            return -1;
+        }
+
+        /* Map speed to pwm value */
+        switch (speed) {
+            case I8K_FAN_OFF:
+                pwm_value = 0;
+                break;
+            case I8K_FAN_LOW:
+                pwm_value = 128;
+                break;
+            case I8K_FAN_HIGH:
+                pwm_value = 255;
+                break;
+            default:
+                return -1;
+        }
+
+        if (write_hwmon_int(pwm_file, pwm_value) < 0) {
+            return -1;
+        }
+
+        return speed;
+    }
 
     args[0] = fan;
     args[1] = speed;
@@ -127,6 +305,22 @@ i8k_get_fan_status(int fan)
     int args[1];
     int rc;
 
+    if (use_hwmon) {
+        /* Map pwm value (0-255) to fan state (0=off, 1=low, 2=high) */
+        const char *pwm_file = (fan == I8K_FAN_LEFT) ? "pwm1" : "pwm2";
+        int pwm = read_hwmon_int(pwm_file);
+        if (pwm < 0) {
+            return pwm;
+        }
+        if (pwm == 0) {
+            return I8K_FAN_OFF;
+        } else if (pwm < 128) {
+            return I8K_FAN_LOW;
+        } else {
+            return I8K_FAN_HIGH;
+        }
+    }
+
     args[0] = fan;
     if ((rc=ioctl(i8k_fd, I8K_GET_FAN, &args)) < 0) {
 	return rc;
@@ -140,6 +334,12 @@ i8k_get_fan_speed(int fan)
 {
     int args[1];
     int rc;
+
+    if (use_hwmon) {
+        /* fan is 0 for right, 1 for left in i8k, but 1/2 in hwmon */
+        const char *fan_file = (fan == I8K_FAN_LEFT) ? "fan1_input" : "fan2_input";
+        return read_hwmon_int(fan_file);
+    }
 
     args[0] = fan;
     if ((rc=ioctl(i8k_fd, I8K_GET_SPEED, &args)) < 0) {
@@ -155,6 +355,15 @@ i8k_get_cpu_temp()
     int args[1];
     int rc;
 
+    if (use_hwmon) {
+        /* hwmon reports temperature in millidegrees, convert to degrees */
+        int temp = read_hwmon_int("temp1_input");
+        if (temp < 0) {
+            return temp;
+        }
+        return temp / 1000;
+    }
+
     if ((rc=ioctl(i8k_fd, I8K_GET_TEMP, &args)) < 0) {
 	return rc;
     }
@@ -168,6 +377,11 @@ i8k_get_power_status()
     int args[1];
     int rc;
 
+    if (use_hwmon) {
+        /* Power status not available via hwmon, return -1 */
+        return -1;
+    }
+
     if ((rc=ioctl(i8k_fd, I8K_POWER_STATUS, &args)) < 0) {
 	return rc;
     }
@@ -180,6 +394,11 @@ i8k_get_fn_status()
 {
     int args[1];
     int rc;
+
+    if (use_hwmon) {
+        /* Fn key status not available via hwmon, return -1 */
+        return -1;
+    }
 
     if ((rc=ioctl(i8k_fd, I8K_FN_STATUS, &args)) < 0) {
 	return rc;
@@ -328,13 +547,21 @@ void init()
     i8k_fd = open(I8K_PROC, O_RDONLY);
     if (i8k_fd < 0)
     {
-        perror("can't open " I8K_PROC);
-        exit(-1);
+        /* Try to use hwmon interface as fallback */
+        if (find_dell_hwmon() == 0) {
+            use_hwmon = 1;
+            i8k_fd = 0; /* Dummy value */
+        } else {
+            perror("can't open " I8K_PROC " or find dell_smm hwmon device");
+            exit(-1);
+        }
     }
 }
 void finish()
 {
-    close(i8k_fd);
+    if (!use_hwmon) {
+        close(i8k_fd);
+    }
 }
 #else
 int
@@ -349,8 +576,14 @@ main(int argc, char **argv)
 
     i8k_fd = open(I8K_PROC, O_RDONLY);
     if (i8k_fd < 0) {
-        perror("can't open " I8K_PROC);
-        exit(-1);
+        /* Try to use hwmon interface as fallback */
+        if (find_dell_hwmon() == 0) {
+            use_hwmon = 1;
+            i8k_fd = 0; /* Dummy value */
+        } else {
+            fprintf(stderr, "can't open " I8K_PROC " or find dell_smm hwmon device\n");
+            exit(-1);
+        }
     }
 
     /* -2 as a magic number: if var 'ret' reachs the end of main() as -2, than
@@ -392,7 +625,9 @@ main(int argc, char **argv)
         ret = fn_key();
     }
 
-    close(i8k_fd);
+    if (!use_hwmon) {
+        close(i8k_fd);
+    }
 
     if (ret == -2) // no command executed
         fprintf(stderr,"invalid arg: %s\n", argv[1]);
